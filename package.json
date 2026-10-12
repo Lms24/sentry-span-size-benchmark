@@ -1,0 +1,14 @@
+{
+  "name": "sentry-span-size-benchmark",
+  "private": true,
+  "type": "module",
+  "description": "Benchmark: estimating vs. measuring the serialized size of Sentry streamed spans",
+  "scripts": {
+    "bench": "node orchestrate.mjs",
+    "sizes": "node sizes.mjs",
+    "bench:entries": "node entries.mjs many_attrs && node entries.mjs http_server"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
