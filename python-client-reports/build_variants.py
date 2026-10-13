@@ -10,7 +10,7 @@ import shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("SENTRY_PY_REPO")
 
-VARIANTS = ["none", "current", "estimate", "hybrid", "exact"]
+VARIANTS = ["none", "estimate", "exact"]
 
 SIZE_MODULE = '''
 from sentry_sdk.utils import json_dumps
@@ -41,13 +41,6 @@ def estimate_container(payload):
             value = attr["value"]
             estimate += 50 + (len(value) if isinstance(value, str) else len(str(value)))
     return estimate
-
-
-def cached_or_estimate(item):
-    # PayloadRef caches its serialized bytes once the envelope was sent (network_error,
-    # send_error). Use them when present, estimate otherwise (ratelimit_backoff, queue_overflow).
-    cached = item.payload.bytes
-    return len(cached) if cached is not None else estimate_container(item.payload.json)
 
 
 def exact_log(log):
@@ -129,8 +122,8 @@ def client_patches(kind):
 
 
 def patches_for(variant):
-    if variant == "current":
-        return {}
+    # sentry-python already records an exact log_byte in the transport and in LogBatcher._record_lost.
+    # `none` removes it, so every variant is measured against "no byte outcomes at all".
     if variant == "none":
         return {
             "transport.py": [(TRANSPORT_LOG_BYTE, TRANSPORT_LOG_BYTE.replace(
@@ -141,12 +134,9 @@ def patches_for(variant):
 ''')],
         }
 
-    # "hybrid" = estimate everywhere, except the transport uses already-serialized bytes when available
-    kind = "estimate" if variant == "hybrid" else variant
+    kind = variant  # "estimate" or "exact"
     if kind == "estimate":
-        transport_size = (
-            "_size.cached_or_estimate(item)" if variant == "hybrid" else "_size.estimate_container(item.payload.json)"
-        )
+        transport_size = "_size.estimate_container(item.payload.json)"
         transport_log = TRANSPORT_LOG_BYTE.replace("len(item.get_bytes())", transport_size)
         metric_size = transport_size
         log_lost = '''    def _record_lost(self, item: "Log") -> None:

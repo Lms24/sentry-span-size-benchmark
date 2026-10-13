@@ -312,42 +312,43 @@ records bytes for capture-time drops.
 
 **Variants:**
 
+To compare against "no byte outcomes at all", like the JS `baseline`, the `none` variant removes the existing
+`log_byte` code. The `exact` variant uses the same method sentry-python already uses for logs, and extends it to
+metrics and to the capture-time drops.
+
 | Variant | Size |
 | ------- | ---- |
-| `none` | no byte outcomes anywhere (the existing `log_byte` is removed) |
-| `current` | sentry-python as it is today |
-| `estimate` | logs and metrics at every site, estimated like `SpanBatcher._estimate_size` (1 per char, 50 per attribute) |
-| `hybrid` | like `estimate`, but the transport uses `PayloadRef`'s cached bytes when they exist |
+| `none` | none (the existing `log_byte` code removed) |
+| `estimate` | logs and metrics at every site, estimated like `SpanBatcher._estimate_size`: 100 + 1 per char of body/name, plus 50 + the value's length per attribute |
 | `exact` | logs and metrics at every site: `len(json_dumps(_to_transport_format(item)))`, or `len(item.get_bytes())` in the transport |
 
-**Runtime.** µs per operation, with the added µs vs `none`:
+**Runtime.** µs per operation, with the added µs and % vs `none`:
 
-| Drop path | none | current | estimate | **hybrid** | exact |
-| --------- | ---- | ------- | -------- | ---------- | ----- |
-| log `before_send` (small) | 6.22 | ±0 | +1.1 (18%) | **+1.2 (19%)** | +11.5 (186%) |
-| log `before_send` (2 KB) | 5.71 | ±0 | +0.9 (16%) | **+0.9 (17%)** | +16.4 (287%) |
-| metric `before_send` | 4.33 | ±0 | +0.5 (12%) | **+0.7 (15%)** | +8.1 (185%) |
-| batcher log `queue_overflow` | 0.43 | +11.1 | +1.1 | **+1.1** | +11.0 |
-| batcher metric `queue_overflow` | 0.43 | ±0 | +0.6 | **+0.6** | +7.4 |
-| `network_error`, 100 logs | 574 | ±0 | +130 (23%) | **±0** | ±0 |
-| `network_error`, 1000 metrics | 3681 | ±0 | +659 (18%) | **+67 (2%)** | ±0 |
-| `ratelimit_backoff`, 100 logs | 1.74 | +566 | +129 | **+129** | +576 |
-| `ratelimit_backoff`, 1000 metrics | 1.73 | ±0 | +584 | **+597** | +3732 |
+| Drop path | none | estimate | exact |
+| --------- | ---- | -------- | ----- |
+| log `before_send` (small) | 6.22 | +1.1 (18%) | +11.5 (186%) |
+| log `before_send` (2 KB) | 5.71 | +0.9 (16%) | +16.4 (287%) |
+| metric `before_send` | 4.33 | +0.5 (12%) | +8.1 (185%) |
+| batcher log `queue_overflow` | 0.43 | +1.1 | +11.0 |
+| batcher metric `queue_overflow` | 0.43 | +0.6 | +7.4 |
+| `network_error`, 100 logs | 574 | +130 (23%) | ±0 |
+| `network_error`, 1000 metrics | 3681 | +659 (18%) | ±0 |
+| `ratelimit_backoff`, 100 logs | 1.74 | +129 | +576 |
+| `ratelimit_backoff`, 1000 metrics | 1.73 | +584 | +3732 |
 
-"±0" means within run-to-run noise. The capture rows for `current` are unchanged code and show +2% at most.
+"±0" means within run-to-run noise. `send_error` behaves like `network_error`. Transport `queue_overflow` and
+`internal_sdk_error` behave like `ratelimit_backoff`.
 
 **Takeaways (Python):**
 
-- **The current exact `log_byte` is costly exactly where nothing else is.** While rate-limited, each 100-log envelope
-  costs about 0.57 ms of `json_dumps` for data that is never sent; without byte outcomes it costs 1.7 µs. Each log
-  dropped on buffer overflow costs 11 µs instead of 0.4 µs, because a whole envelope item is built for it.
-- **On `network_error`/`send_error`, the exact size is free.** `PayloadRef` has already cached the serialized bytes.
-  Here the estimate is *slower* than the exact size (+130 µs per 100 logs).
-- **`hybrid` combines the best of both.** It uses cached bytes when they exist and estimates otherwise. Compared with
-  today's exact approach, it cuts the rate-limited log path by about 4.4× and the log overflow path by about 10×, and
-  it adds metric bytes at all sites.
-- **Estimating in pure Python is not free.** It costs about 1.3 µs per log and 0.6 µs per metric, because it loops
-  over every attribute. That is still 4–6× cheaper than `json_dumps`.
+- **The estimate is cheaper everywhere, except after a failed send.** On `network_error`/`send_error`, `PayloadRef`
+  has already cached the serialized bytes, so `exact` is just `len()` of them. There the estimate is *slower* (+130 µs
+  per 100 logs), because it still walks every attribute.
+- **The exact size is expensive whenever nothing was serialized yet.** While rate-limited, each 100-log envelope costs
+  about 0.58 ms of `json_dumps` for data that is never sent, instead of 1.7 µs. For 1000 metrics it's 3.7 ms. This is
+  already what sentry-python pays today for the log rows of the `exact` column.
+- **Estimating in pure Python isn't free either.** It costs about 1.3 µs per log and 0.6 µs per metric in the
+  transport, but that's still 4–6× cheaper than `json_dumps`.
 - **For capture-time drops**, the exact size means building the transport format and serializing it: +8 to +16 µs
   per dropped item. That roughly triples the cost of a `before_send_log` drop. The estimate adds about 1 µs.
 
@@ -355,7 +356,7 @@ records bytes for capture-time drops.
 
 | | JavaScript | Python |
 | - | ---------- | ------ |
-| Cheapest at runtime | `estimate_forin` | `hybrid` (cached bytes if available, otherwise estimate) |
+| Cheapest at runtime | `estimate_forin` | `estimate`, except after a failed send, where `exact` is free |
 | Cheapest in bundle size | `exact_textencoder` (+59 to +126 B gzip) | n/a |
 | Worst case of the exact size | +0.9 ms per rate-limited 1000-metric envelope | +3.7 ms per rate-limited 1000-metric envelope |
 | Exact size already cached? | No: `serializeEnvelope` output covers the whole envelope, not each item | Yes, after a send attempt (`PayloadRef.bytes`) |
@@ -388,7 +389,7 @@ node js-client-reports/build-harness.mjs && node js-client-reports/orchestrate.m
 
 # Python
 SENTRY_PY_REPO=/path/to/sentry-python python3 python-client-reports/build_variants.py
-/path/to/sentry-python/.venv/bin/python python-client-reports/orchestrate.py   # runtime (~8 min)
+/path/to/sentry-python/.venv/bin/python python-client-reports/orchestrate.py   # runtime (~5 min)
 ```
 
 Absolute numbers depend on your machine. The ratios between approaches should hold.
