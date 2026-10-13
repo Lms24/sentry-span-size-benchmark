@@ -16,6 +16,12 @@ measuring its exact size, and how accurate it is.
 - [Python](#python) (`python/`)
 - [The two estimates compared](#the-two-estimates-compared)
 
+A second study asks a related question: what would it cost to report the **byte size** of dropped logs and metrics
+in client reports (`log_byte`, plus a metric equivalent), next to the existing `log_item` / `metric` counts?
+
+- [Byte outcomes for dropped logs and metrics](#byte-outcomes-for-dropped-logs-and-metrics)
+  (`js-client-reports/`, `python-client-reports/`)
+
 ## Methodology
 
 Both benchmarks use the same setup:
@@ -198,9 +204,165 @@ estimate counts 1 per character and a flat 50 bytes per attribute. That fits ASC
 6-byte `\uXXXX` escapes Python writes for non-ASCII text. Neither estimate is exact, but both are much cheaper than
 measuring.
 
+## Byte outcomes for dropped logs and metrics
+
+When an SDK drops a log or metric, it records a client report outcome (`log_item`, `metric` / `trace_metric`).
+The question here: what would it cost to also record the dropped **bytes** at every one of those sites, both at
+runtime and in bundle size? This compares estimating the size with measuring it exactly.
+
+Both studies run the **real SDK code**, patched per variant without touching the checkout:
+
+- **JS:** an esbuild plugin patches the TS sources in memory while bundling.
+- **Python:** `build_variants.py` copies `sentry_sdk/` and patches the copy.
+
+Each patch is checked to match exactly once. Each run also confirms that only the patched variants record `*_byte`
+outcomes.
+
+The measuring method matches the span benchmarks: one process per variant, a warmup, 40 samples per scenario, and
+7 rounds in alternating order. Tables show the median per operation.
+
+The metric byte category doesn't exist in either SDK yet. The patches use `trace_metric_byte` as a placeholder
+name; check the real one in Relay.
+
+### JavaScript (`js-client-reports/`)
+
+sentry-javascript `2af75e43f2`, Node 24.21.0.
+
+**Drop sites.** Every place that records `log_item` or `metric`:
+
+| Where | Reasons | Unit |
+| ----- | ------- | ---- |
+| `logs/internal.ts` (`_INTERNAL_captureLog`) | `callback_error`, `before_send` | 1 log, not yet serialized (raw attributes) |
+| `metrics/internal.ts` (`_INTERNAL_captureMetric`) | `callback_error`, `before_send` | 1 metric, not yet serialized |
+| `transports/base.ts` (`recordItemLoss`) | `ratelimit_backoff`, `queue_overflow` | 1 envelope item of up to 100 logs / 1000 metrics, not serialized |
+| `transports/base.ts` (`recordItemLoss`) | `network_error`, `send_error` (413) | same, but the envelope was already serialized |
+
+The transport is part of every bundle, so changing it costs bundle size even for apps that use neither logs nor
+metrics.
+
+**Variants.** Each one adds a `recordDroppedEvent(reason, 'log_byte' | 'trace_metric_byte', size)` next to every
+existing call:
+
+| Variant | Size |
+| ------- | ---- |
+| `baseline` | none (today) |
+| `estimate` | 2 bytes per char, 8 per number. Transport items reuse `estimateTypedAttributesSizeInBytes` |
+| `estimate_forin` | same, but `estimateTypedAttributesSizeInBytes` loops with `for...in` instead of `Object.entries` |
+| `exact_textencoder` | `new TextEncoder().encode(JSON.stringify(x)).length` |
+| `exact_utf8count` | `JSON.stringify` plus a hand-written UTF-8 byte counter (no allocation) |
+
+**Runtime.** µs per operation, with the added µs and % vs `baseline`:
+
+| Drop path | baseline | estimate | **estimate_forin** | exact_textencoder | exact_utf8count |
+| --------- | -------- | -------- | ------------------ | ----------------- | --------------- |
+| log `before_send` (small) | 1.22 | +0.10 (8%) | **+0.08 (7%)** | +0.79 (65%) | +0.91 (75%) |
+| log `before_send` (2 KB) | 1.41 | +0.14 (10%) | **+0.16 (12%)** | +2.40 (171%) | +4.61 (328%) |
+| metric `before_send` | 0.37 | +0.08 (22%) | **+0.08 (23%)** | +0.68 (186%) | +0.82 (223%) |
+| `network_error`, 100 logs | 92.5 | +27.9 (30%) | **+5.5 (6%)** | +101 (110%) | +166 (179%) |
+| `network_error`, 1000 metrics | 810 | +199 (25%) | **+32 (4%)** | +899 (111%) | +1385 (171%) |
+| `ratelimit_backoff`, 100 logs | 0.21 | +26 | **+4.6** | +99 | +165 |
+| `ratelimit_backoff`, 1000 metrics | 0.21 | +212 | **+34** | +897 | +1418 |
+
+`send_error` behaves like `network_error`. `queue_overflow` behaves like `ratelimit_backoff`. The three full runs
+agreed within about 5%.
+
+**Bundle size.** gzip bytes (level 9), built with esbuild minify from the TS sources, debug code removed. These are
+deltas vs `baseline`; the repo's size-limit setup (webpack + terser) will differ slightly.
+
+| Entry (`@sentry/browser` imports) | baseline | estimate | estimate_forin | exact_textencoder | exact_utf8count |
+| --------------------------------- | -------- | -------- | -------------- | ----------------- | --------------- |
+| `init` (transport change only) | 30,339 | +181 | +187 | **+59** | +134 |
+| `init, logger` | 31,523 | +238 | +248 | **+75** | +159 |
+| `init, metrics` | 31,145 | +277 | +282 | **+101** | +184 |
+| `init, metrics, logger` | 31,996 | +272 | +282 | **+96** | +169 |
+| `init, browserTracingIntegration, spanStreamingIntegration, metrics, logger` | 54,462 | +201 | +205 | **+126** | +202 |
+
+`node js-client-reports/bundle-size.mjs` also prints brotli and minified sizes.
+
+**Takeaways (JS):**
+
+- **The exact size is the smallest in bundle size and the slowest at runtime.** Every transport drop serializes the
+  item a second time. While rate-limited, a drop that costs 0.2 µs today would cost 0.1 ms per 100 logs and 0.9 ms
+  per 1000 metrics, all spent serializing data that is never sent.
+- **The hand-written UTF-8 counter loses to `TextEncoder`** both at runtime and in bundle size.
+- **Most of the estimate's cost is `Object.entries`.** With `for...in`, the transport estimate is about 5× cheaper,
+  for about 6 B more gzip than `estimate`.
+- **At capture time every variant is cheap in absolute terms** (+0.1 to +2.4 µs per dropped item). That only adds up
+  when `beforeSendLog` drops most logs.
+
+### Python (`python-client-reports/`)
+
+sentry-python `7cb80948cb`, CPython 3.14.8. Python has no bundle size to worry about, so only runtime is measured.
+
+**What Python does today.** `Transport.record_lost_event` already records an **exact** `log_byte`
+(`len(item.get_bytes())`) whenever a `log` envelope item is lost. On buffer overflow, `LogBatcher._record_lost`
+builds and serializes a one-log envelope item just to get that size. Nothing records bytes for metrics, and nothing
+records bytes for capture-time drops.
+
+**Drop sites:**
+
+| Where | Reasons | Bytes today |
+| ----- | ------- | ----------- |
+| `Client._capture_telemetry` | log `callback_error`, `before_send` | no |
+| `Client._capture_telemetry` | metric `callback_error`, `before_send` | no |
+| `LogBatcher._record_lost` (buffer full, more than 1000 logs) | `queue_overflow` | exact `log_byte` |
+| `MetricsBatcher._record_lost` (buffer full, more than 10,000 metrics) | `queue_overflow` | no |
+| `Transport.record_lost_event(item=...)` | `ratelimit_backoff`, `queue_overflow`, `internal_sdk_error`: item not serialized yet | exact `log_byte`, none for metrics |
+| `Transport.record_lost_event(item=...)` | `network_error`, `send_error`: bytes already cached on `PayloadRef` | exact `log_byte`, none for metrics |
+
+**Variants:**
+
+| Variant | Size |
+| ------- | ---- |
+| `none` | no byte outcomes anywhere (the existing `log_byte` is removed) |
+| `current` | sentry-python as it is today |
+| `estimate` | logs and metrics at every site, estimated like `SpanBatcher._estimate_size` (1 per char, 50 per attribute) |
+| `hybrid` | like `estimate`, but the transport uses `PayloadRef`'s cached bytes when they exist |
+| `exact` | logs and metrics at every site: `len(json_dumps(_to_transport_format(item)))`, or `len(item.get_bytes())` in the transport |
+
+**Runtime.** µs per operation, with the added µs vs `none`:
+
+| Drop path | none | current | estimate | **hybrid** | exact |
+| --------- | ---- | ------- | -------- | ---------- | ----- |
+| log `before_send` (small) | 6.22 | ±0 | +1.1 (18%) | **+1.2 (19%)** | +11.5 (186%) |
+| log `before_send` (2 KB) | 5.71 | ±0 | +0.9 (16%) | **+0.9 (17%)** | +16.4 (287%) |
+| metric `before_send` | 4.33 | ±0 | +0.5 (12%) | **+0.7 (15%)** | +8.1 (185%) |
+| batcher log `queue_overflow` | 0.43 | +11.1 | +1.1 | **+1.1** | +11.0 |
+| batcher metric `queue_overflow` | 0.43 | ±0 | +0.6 | **+0.6** | +7.4 |
+| `network_error`, 100 logs | 574 | ±0 | +130 (23%) | **±0** | ±0 |
+| `network_error`, 1000 metrics | 3681 | ±0 | +659 (18%) | **+67 (2%)** | ±0 |
+| `ratelimit_backoff`, 100 logs | 1.74 | +566 | +129 | **+129** | +576 |
+| `ratelimit_backoff`, 1000 metrics | 1.73 | ±0 | +584 | **+597** | +3732 |
+
+"±0" means within run-to-run noise. The capture rows for `current` are unchanged code and show +2% at most.
+
+**Takeaways (Python):**
+
+- **The current exact `log_byte` is costly exactly where nothing else is.** While rate-limited, each 100-log envelope
+  costs about 0.57 ms of `json_dumps` for data that is never sent; without byte outcomes it costs 1.7 µs. Each log
+  dropped on buffer overflow costs 11 µs instead of 0.4 µs, because a whole envelope item is built for it.
+- **On `network_error`/`send_error`, the exact size is free.** `PayloadRef` has already cached the serialized bytes.
+  Here the estimate is *slower* than the exact size (+130 µs per 100 logs).
+- **`hybrid` combines the best of both.** It uses cached bytes when they exist and estimates otherwise. Compared with
+  today's exact approach, it cuts the rate-limited log path by about 4.4× and the log overflow path by about 10×, and
+  it adds metric bytes at all sites.
+- **Estimating in pure Python is not free.** It costs about 1.3 µs per log and 0.6 µs per metric, because it loops
+  over every attribute. That is still 4–6× cheaper than `json_dumps`.
+- **For capture-time drops**, the exact size means building the transport format and serializing it: +8 to +16 µs
+  per dropped item. That roughly triples the cost of a `before_send_log` drop. The estimate adds about 1 µs.
+
+### Overall
+
+| | JavaScript | Python |
+| - | ---------- | ------ |
+| Cheapest at runtime | `estimate_forin` | `hybrid` (cached bytes if available, otherwise estimate) |
+| Cheapest in bundle size | `exact_textencoder` (+59 to +126 B gzip) | n/a |
+| Worst case of the exact size | +0.9 ms per rate-limited 1000-metric envelope | +3.7 ms per rate-limited 1000-metric envelope |
+| Exact size already cached? | No: `serializeEnvelope` output covers the whole envelope, not each item | Yes, after a send attempt (`PayloadRef.bytes`) |
+
 ## Running it
 
-Needs Node 20+ and Python 3.9+. There are no dependencies.
+Needs Node 20+ and Python 3.9+. The span benchmarks have no dependencies.
 
 ```sh
 # JavaScript
@@ -211,6 +373,22 @@ node js/entries.mjs many_attrs # Object.entries vs for...in
 # Python
 python3 python/orchestrate.py  # full benchmark (~3 min)
 python3 python/sizes.py        # accuracy table
+```
+
+The byte-outcome studies need SDK checkouts. For JS, `yarn install` must have been run; esbuild and
+`@sentry/conventions` are loaded from its `node_modules`. For Python, the interpreter needs `urllib3` and `certifi`
+(the checkout's dev venv has both):
+
+```sh
+# JavaScript
+export SENTRY_JS_REPO=/path/to/sentry-javascript
+# export SENTRY_JS_NODE_MODULES=...  # only if SENTRY_JS_REPO is a git worktree without node_modules
+node js-client-reports/bundle-size.mjs                                     # bundle size table
+node js-client-reports/build-harness.mjs && node js-client-reports/orchestrate.mjs  # runtime (~6 min)
+
+# Python
+SENTRY_PY_REPO=/path/to/sentry-python python3 python-client-reports/build_variants.py
+/path/to/sentry-python/.venv/bin/python python-client-reports/orchestrate.py   # runtime (~8 min)
 ```
 
 Absolute numbers depend on your machine. The ratios between approaches should hold.
