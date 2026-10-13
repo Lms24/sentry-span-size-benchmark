@@ -1,5 +1,5 @@
 {
-  "name": "sentry-span-size-benchmark",
+  "name": "sentry-telemetry-size-benchmark-js",
   "private": true,
   "type": "module",
   "description": "Benchmark: estimating vs. measuring the serialized size of Sentry streamed spans",

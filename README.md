@@ -1,28 +1,50 @@
-# Sentry span size benchmark
+# Sentry telemetry size benchmark
 
-With span streaming, the Sentry SDKs buffer spans per trace and flush a buffer once it gets too big. To do that,
-they need a size for each span as it is added. The JavaScript and Python SDKs both **estimate** that size instead of
-serializing the span. This repo checks whether the estimate actually costs less than serializing the span and
-measuring its exact size, and how accurate it is.
+Sentry SDKs need to know how big their telemetry is, in two places:
 
-**Result: in both SDKs, the estimate costs less in every scenario.**
+1. **Span buffers.** With span streaming, spans are buffered per trace, and a buffer is flushed once it gets too big.
+   The SDKs need a size for each span as it is added.
+2. **Client reports.** When the SDK drops a log or metric, it records the lost item count. A byte count could be
+   recorded too (`log_byte`, plus a metric equivalent).
 
-| SDK        | Estimate                                        | Speed-up over exact size, typical spans | Range     |
-| ---------- | ----------------------------------------------- | --------------------------------------- | --------- |
-| JavaScript | `estimateSerializedSpanSizeInBytes`             | 3–4×                                    | 1.3–31×   |
-| Python     | `SpanBatcher._estimate_size`                    | 11–16×                                  | 10–32×    |
+In both places, the size can be **estimated** or **measured exactly** by serializing the item. This repo measures what
+each option costs, in the Sentry JavaScript and Python SDKs.
+
+## Results at a glance
+
+**[Span size estimates](#span-size-estimates)** (`js/`, `python/`): in both SDKs, the existing estimate is cheaper than
+serializing the span, in every scenario.
+
+| SDK        | Estimate                            | Speed-up over exact size, typical spans | Range   |
+| ---------- | ----------------------------------- | --------------------------------------- | ------- |
+| JavaScript | `estimateSerializedSpanSizeInBytes` | 3–4×                                    | 1.3–31× |
+| Python     | `SpanBatcher._estimate_size`        | 11–16×                                  | 10–32×  |
+
+**[Byte outcomes for dropped logs and metrics](#byte-outcomes-for-dropped-logs-and-metrics)**
+(`js-client-reports/`, `python-client-reports/`): estimating the size is much cheaper at runtime than measuring it
+exactly. The exact size is only free in Python after a failed send, when the serialized bytes are already cached. In
+JS, the exact size (via `TextEncoder`) adds the least to the bundle: +59 to +126 B gzip, compared with about +190 to
++280 B for the estimate.
+
+| Worst case (rate-limited, 1000 metrics per envelope) | No byte outcome | Estimate     | Exact    |
+| ---------------------------------------------------- | --------------- | ------------ | -------- |
+| JavaScript                                           | 0.2 µs          | +34 µs¹      | +0.9 ms  |
+| Python                                               | 1.7 µs          | +0.58 ms     | +3.7 ms  |
+
+¹ with `for...in` in `estimateTypedAttributesSizeInBytes`; +0.21 ms with the current `Object.entries` loop.
+
+All results: Apple M4 Max, macOS.
+
+## Span size estimates
+
+The JavaScript and Python SDKs both **estimate** each span's size instead of serializing it. This study checks whether
+the estimate actually costs less than measuring the exact size, and how accurate it is.
 
 - [JavaScript](#javascript) (`js/`)
 - [Python](#python) (`python/`)
 - [The two estimates compared](#the-two-estimates-compared)
 
-A second study asks a related question: what would it cost to report the **byte size** of dropped logs and metrics
-in client reports (`log_byte`, plus a metric equivalent), next to the existing `log_item` / `metric` counts?
-
-- [Byte outcomes for dropped logs and metrics](#byte-outcomes-for-dropped-logs-and-metrics)
-  (`js-client-reports/`, `python-client-reports/`)
-
-## Methodology
+### Methodology
 
 Both benchmarks use the same setup:
 
@@ -42,7 +64,7 @@ Both benchmarks use the same setup:
   7 per-round medians, ± half the range across rounds.
 - **Dead-code elimination** is prevented by adding every result to a sink that is printed at the end.
 
-### Scenarios
+#### Scenarios
 
 The same span shapes are used in both languages (`js/spans.mjs`, `python/spans.py`):
 
@@ -57,9 +79,7 @@ The same span shapes are used in both languages (`js/spans.mjs`, `python/spans.p
 | `unicode`      | Non-ASCII span name and attribute values (umlauts, CJK, emoji)                       |
 | `mixed`        | A shuffled mix of all scenarios above                                                |
 
-All results: Apple M4 Max, macOS.
-
-## JavaScript
+### JavaScript
 
 Source: [`estimateSerializedSpanSizeInBytes`](https://github.com/getsentry/sentry-javascript/blob/2af75e43f218ec63eba9cca337a27e7128b4e254/packages/core/src/tracing/spans/estimateSize.ts)
 at sentry-javascript `2af75e43f2`. Spans are already in the typed attribute format (`{ type, value }`) when they
@@ -72,7 +92,7 @@ reach the buffer.
 | `stringify_textencoder`       | `encoder.encode(JSON.stringify(span)).length`           | Yes, works in every runtime         |
 | `stringify_buffer_bytelength` | `Buffer.byteLength(JSON.stringify(span), 'utf8')`       | Yes, Node only                      |
 
-### Speed
+#### Speed
 
 Node 24.21.0. Median ns per call, with the slowdown relative to `estimate` in parentheses.
 
@@ -87,7 +107,7 @@ Node 24.21.0. Median ns per call, with the slowdown relative to `estimate` in pa
 | `unicode`      | **265 ± 6**    | 2395 ± 120 (9.0×)  | 5182 ± 376 (19.5×)      | 3057 ± 90 (11.5×)             |
 | `mixed`        | **1078 ± 66**  | 3145 ± 642 (2.9×)  | 4316 ± 245 (4.0×)       | 3577 ± 119 (3.3×)             |
 
-### Accuracy
+#### Accuracy
 
 One sample span per scenario (`node js/sizes.mjs`), sizes in bytes:
 
@@ -105,7 +125,7 @@ The estimate undercounts small spans and overcounts large strings by about 1.9×
 character. That is acceptable for deciding when to flush. Note that `JSON.stringify().length` is also wrong for
 non-ASCII content.
 
-### Observations
+#### Observations
 
 - **`TextEncoder` is the slowest and least stable option**, because it allocates a `Uint8Array` for every span. It is
   also the only exact option that works in every runtime.
@@ -119,7 +139,7 @@ non-ASCII content.
 
   Using `for...in` in `estimateTypedAttributesSizeInBytes` would make the estimate about 4× faster again.
 
-## Python
+### Python
 
 Source: [`SpanBatcher._estimate_size`](https://github.com/getsentry/sentry-python/blob/7cb80948cbdefb10831740c23b49e56e348532a5/sentry_sdk/_span_batcher.py#L156-L170)
 at sentry-python `7cb80948cb`:
@@ -148,7 +168,7 @@ time means doing that conversion _and_ serializing:
 `exact_str_len` gives the same number as `exact_bytes`: `json.dumps` escapes non-ASCII characters by default, so the
 output is pure ASCII.
 
-### Speed
+#### Speed
 
 CPython 3.14.8. Median ns per call, with the slowdown relative to `estimate` in parentheses.
 
@@ -162,7 +182,7 @@ CPython 3.14.8. Median ns per call, with the slowdown relative to `estimate` in 
 | `unicode`      | **398 ± 20**    | 8369 ± 301 (21×)     | 8131 ± 391 (20×)     |
 | `mixed`        | **1089 ± 25**   | 15623 ± 471 (14×)    | 15132 ± 618 (14×)    |
 
-### Accuracy
+#### Accuracy
 
 Average over 100 spans per scenario (`python3 python/sizes.py`), sizes in bytes:
 
@@ -175,7 +195,7 @@ Average over 100 spans per scenario (`python3 python/sizes.py`), sizes in bytes:
 | `many_attrs`   | 4492     | 4233        | 1.06             |
 | `unicode`      | 1082     | 2363        | 0.46             |
 
-### Observations
+#### Observations
 
 - **The gap is much bigger than in JS** (10–32× instead of 1.3–31×). An exact size in Python needs the
   pure-Python `to_transport_format` step to build a new dict for every attribute, and then `json.dumps`.
@@ -185,7 +205,7 @@ Average over 100 spans per scenario (`python3 python/sizes.py`), sizes in bytes:
 - **It undercounts non-ASCII text by about 2×.** `json.dumps` writes each non-ASCII character as a `\uXXXX`
   escape (6 bytes, or 12 for an emoji), but the estimate counts 1 per character.
 
-## The two estimates compared
+### The two estimates compared
 
 |                          | JavaScript                                  | Python                                   |
 | ------------------------ | ------------------------------------------- | ---------------------------------------- |
