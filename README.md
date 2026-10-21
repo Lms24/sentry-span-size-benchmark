@@ -15,13 +15,14 @@ each option costs, in the Sentry JavaScript and Python SDKs.
 **[Byte outcomes for dropped logs and metrics](#byte-outcomes-for-dropped-logs-and-metrics)**: extra cost of recording
 the dropped bytes, compared with recording no bytes.
 
-|                                      | [JavaScript](#javascript-js-client-reports) | [Python](#python-python-client-reports) |
-| ------------------------------------ | ------------------------------------------- | --------------------------------------- |
-| Estimate, per drop                   | +5–30%                                      | +12–23%                                 |
-| Exact, per drop                      | +65–190%                                    | +185–290%, but free after a failed send |
-| Rate-limited envelope (today: ~1 µs) | estimate ~10 µs, exact ~0.1–1 ms            | estimate ~0.1–0.6 ms, exact ~0.6–4 ms   |
-| Bundle size (gzip)                   | estimate +0.4–0.9%, exact +0.2–0.3%         | n/a                                     |
-| Cheapest option                      | estimate at runtime, exact in bundle size   | estimate, except after a failed send    |
+|                                 | [JavaScript](#javascript-js-client-reports)        | [Python](#python-python-client-reports)            |
+| ------------------------------- | -------------------------------------------------- | -------------------------------------------------- |
+| No byte outcome (baseline)      | ~0.4–1.4 µs per drop, ~0.1–0.8 ms per failed send  | ~4–6 µs per drop, ~0.6–3.7 ms per failed send      |
+| Estimate, per drop              | +5–30%                                             | +12–23%                                            |
+| Exact, per drop                 | +65–190%                                           | +185–290%, but free after a failed send            |
+| Rate-limited envelope           | baseline <1 µs, estimate ~10 µs, exact ~0.1–1 ms   | baseline ~2 µs, estimate ~0.1–0.6 ms, exact ~0.6–4 ms |
+| Bundle size (gzip)              | estimate +0.4–0.9%, exact +0.2–0.3%                | n/a                                                |
+| Cheapest option                 | estimate at runtime, exact in bundle size          | estimate, except after a failed send               |
 
 **[Span size estimates](#span-size-estimates)**: the existing estimate compared with measuring the exact size.
 
