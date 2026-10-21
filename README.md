@@ -10,28 +10,26 @@ Sentry SDKs need to know how big their telemetry is, in a few places:
 In both places, the size can be **estimated** or **measured exactly** by serializing the item. This repo measures what
 each option costs, in the Sentry JavaScript and Python SDKs.
 
-## Results at a glance
+## Summary
 
-**[Byte outcomes for dropped logs and metrics](#byte-outcomes-for-dropped-logs-and-metrics)**
-(`js-client-reports/`, `python-client-reports/`): estimating the size is much cheaper at runtime than measuring it
-exactly. The exact size is only free in Python after a failed send, when the serialized bytes are already cached. In
-JS, the exact size (via `TextEncoder`) adds the least to the bundle: +59 to +126 B gzip, compared with about +190 to
-+280 B for the estimate.
+**[Byte outcomes for dropped logs and metrics](#byte-outcomes-for-dropped-logs-and-metrics)**: extra cost of recording
+the dropped bytes, compared with recording no bytes.
 
-| Worst case (rate-limited, 1000 metrics per envelope) | No byte outcome | Estimate     | Exact    |
-| ---------------------------------------------------- | --------------- | ------------ | -------- |
-| JavaScript                                           | 0.2 µs          | +34 µs¹      | +0.9 ms  |
-| Python                                               | 1.7 µs          | +0.58 ms     | +3.7 ms  |
+|                                      | [JavaScript](#javascript-js-client-reports) | [Python](#python-python-client-reports) |
+| ------------------------------------ | ------------------------------------------- | --------------------------------------- |
+| Estimate, per drop                   | +5–30%                                      | +12–23%                                 |
+| Exact, per drop                      | +65–190%                                    | +185–290%, but free after a failed send |
+| Rate-limited envelope (today: ~1 µs) | estimate ~10 µs, exact ~0.1–1 ms            | estimate ~0.1–0.6 ms, exact ~0.6–4 ms   |
+| Bundle size (gzip)                   | estimate +0.4–0.9%, exact +0.2–0.3%         | n/a                                     |
+| Cheapest option                      | estimate at runtime, exact in bundle size   | estimate, except after a failed send    |
 
-¹ with `for...in` in `estimateTypedAttributesSizeInBytes`; +0.21 ms with the current `Object.entries` loop.
+**[Span size estimates](#span-size-estimates)**: the existing estimate compared with measuring the exact size.
 
-**[Span size estimates](#span-size-estimates)** (`js/`, `python/`): in both SDKs, the existing estimate is cheaper than
-serializing the span, in every scenario.
-
-| SDK        | Estimate                            | Speed-up over exact size, typical spans | Range   |
-| ---------- | ----------------------------------- | --------------------------------------- | ------- |
-| JavaScript | `estimateSerializedSpanSizeInBytes` | 3–4×                                    | 1.3–31× |
-| Python     | `SpanBatcher._estimate_size`        | 11–16×                                  | 10–32×  |
+|                     | [JavaScript](#javascript)   | [Python](#python)             |
+| ------------------- | --------------------------- | ----------------------------- |
+| Speed               | 3–5× faster (range 1.3–31×) | 10–30× faster                 |
+| Accuracy, ASCII     | −30% to +90%                | within ±6% (small spans −12%) |
+| Accuracy, non-ASCII | −10%                        | −54%                          |
 
 All results: Apple M4 Max, macOS.
 
